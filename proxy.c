@@ -17,20 +17,119 @@
  */
 int parse_uri(char *uri, char *target_addr, char *path, int  *port);
 void format_log_entry(char *logstring, struct sockaddr_in *sockaddr, char *uri, int size);
+void echo(int connfd);
+char *getURIFromRequest(int connfd);
+ssize_t Rio_readlineb_w(rio_t *rp, void *usrbuf, size_t maxlen);
+int Rio_writen_w(int fd, void *usrbuf, size_t n);
+ssize_t Rio_readnb(rio_t *rp, void *usrbuf, size_t n);
 
 /* 
  * main - Main routine for the proxy program 
  */
 int main(int argc, char **argv)
 {
+	int listenfd, connfd, port;
+	socklen_t clientlen = sizeof(struct sockaddr_in);
+	struct sockaddr_in clientaddr;
+	struct hostent *hp;
+	char *haddrp;
+	char *URI;
+
+	char serverName[128];
+	serverName[0] = '\0';
+	char serverPathName[128];
+	int serverPort[1];
 
     /* Check arguments */
-    if (argc != 2) {
-	fprintf(stderr, "Usage: %s <port number>\n", argv[0]);
-	exit(0);
+    if (argc != 2) 
+	{
+		fprintf(stderr, "Usage: %s <port number>\n", argv[0]);
+		exit(0);
     }
 
+	port = atoi(argv[1]);
+	listenfd = Open_listenfd(port);
+
+	// Start listener
+	while (1)
+	{
+		connfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
+
+		/* Determine the domain name and IP address of the client */
+		hp = Gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr,
+							sizeof(clientaddr.sin_addr.s_addr), AF_INET);
+		haddrp = inet_ntoa(clientaddr.sin_addr);
+		printf("server connected to %s (%s)\n", hp->h_name, haddrp);	
+		
+		// Get the URI from the HTTP request	
+		URI = getURIFromRequest(connfd);	
+
+		printf("URI: %s, %lu \n", (char *)URI, strlen(URI));					
+
+		
+		//serverName = malloc(sizeof(char) * 128);
+		//serverPathName = malloc(sizeof(char) * 128);
+		//serverPort = malloc(sizeof(int));
+		
+		if (parse_uri(URI, serverName, serverPathName, serverPort) == -1)
+			printf("Error yo!\n");
+
+		Close(connfd);
+	}	
+
     exit(0);
+}
+
+/*
+ * echo - ECHO
+ * Function that reads and echoes text lines.
+ */
+void echo(int connfd)
+{
+	int n;
+	char buf[MAXLINE];
+	rio_t rio;
+
+	Rio_readinitb(&rio, connfd);
+	while (( n = Rio_readlineb(&rio, buf, MAXLINE)) != 0)
+	{
+		printf("%s",buf);
+		Rio_writen(connfd, buf, n);
+	}
+}
+
+/*
+ * getURIFromRequest - Parses the URI from the HTTP Request.
+ */
+char *getURIFromRequest(int connfd)
+{
+	int n;
+	char buf[MAXLINE];
+	rio_t rio;
+	char *host = malloc(sizeof(char) * 128);
+	char *URI_short = malloc(sizeof(char) * 128);
+	char *URI = malloc(sizeof(char) * 128);	
+
+	Rio_readinitb(&rio, connfd);
+	while (( n = Rio_readlineb_w(&rio, buf, MAXLINE)) != 0)
+	{
+		sscanf(buf, "%s %s", host, URI_short);
+
+		if (!strcmp(host, "Host:"))
+		{
+			strcpy(URI, "http://");
+			strcat(URI, URI_short);
+			URI[strlen(URI)] = '\0';	
+	
+			free(host);
+			free(URI_short);
+
+			printf("Size %lu: \n", strlen(URI));
+			return URI;
+		}
+	}
+	
+	return NULL;
 }
 
 
@@ -53,20 +152,31 @@ int parse_uri(char *uri, char *hostname, char *pathname, int *port)
 	hostname[0] = '\0';
 	return -1;
     }
+	printf("1\n");
        
     /* Extract the host name */
     hostbegin = uri + 7;
+	printf("Hostbegin: %s \n", (char *)hostbegin);
     hostend = strpbrk(hostbegin, " :/\r\n\0");
+	printf("Hostend: %s \n", (char *)hostend);
+	printf("2\n");
     len = hostend - hostbegin;
+	printf("Len: %d \n",len);
     strncpy(hostname, hostbegin, len);
+	printf("2\n");
     hostname[len] = '\0';
+
+	printf("1\n");
+
     
     /* Extract the port number */
     *port = 80; /* default */
     if (*hostend == ':')   
 	*port = atoi(hostend + 1);
     
-    /* Extract the path */
+	printf("1\n");
+    
+	/* Extract the path */
     pathbegin = strchr(hostbegin, '/');
     if (pathbegin == NULL) {
 	pathname[0] = '\0';
@@ -113,6 +223,46 @@ void format_log_entry(char *logstring, struct sockaddr_in *sockaddr,
 
     /* Return the formatted log entry string */
     sprintf(logstring, "%s: %d.%d.%d.%d %s", time_str, a, b, c, d, uri);
+}
+
+/************************************
+ * Wrappers for rpbust I/O routines
+ ************************************/
+ssize_t Rio_readlineb_w(rio_t *rp, void *usrbuf, size_t maxlen)
+{
+	ssize_t rc;
+
+	if (( rc = rio_readlineb(rp, usrbuf, maxlen )) < 0)
+	{
+		printf("Rio_readlineb_w error!\n");
+		return 0; // Return EOF if error
+	}
+
+	return rc;
+}
+
+int Rio_writen_w(int fd, void *usrbuf, size_t n)
+{
+	if (rio_writen(fd, usrbuf, n) != n)
+	{
+		printf("Rio_writen_w error!\n");
+		return 0;
+	}
+
+	return 1;
+}
+
+ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n)
+{
+	size_t rc;
+
+	if ( (rc = rio_readnb(rp, usrbuf, n)) < 0)
+	{
+		printf("Rio_readnb_w error!\n");
+		return 0;
+	}
+
+	return rc;
 }
 
 
