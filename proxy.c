@@ -11,6 +11,9 @@
  */ 
 
 #include "csapp.h"
+#include "sys/param.h"
+
+
 
 /*
  * Function prototypes
@@ -25,6 +28,13 @@ ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n);
 int invalidURI(char URI[]);
 int connectionClientServer(int clientfd);
 
+void sigpipehandler(int sig)
+{
+	/* DO NOTHING */
+}
+
+
+
 /* 
  * main - Main routine for the proxy program 
  */
@@ -33,8 +43,8 @@ int main(int argc, char **argv)
 	int listenfd, clientfd, port;
 	socklen_t clientlen = sizeof(struct sockaddr_in);
 	struct sockaddr_in clientaddr;
-	struct hostent *hp;
-	char *haddrp;
+	//struct hostent *hp;
+	//char *haddrp;
 
 	/* Check arguments */
     if (argc != 2) 
@@ -43,30 +53,40 @@ int main(int argc, char **argv)
 		exit(0);
     }
 
+	signal(SIGPIPE, sigpipehandler);
+
 	port = atoi(argv[1]); // proxy port
 	listenfd = Open_listenfd(port);
 
 	// Start listener
 	while (1)
 	{
+
 		clientfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
+		
+
+		printf("\n");
+		printf("------------ Start connection ------------ \n");
 
 		/* Determine the domain name and IP address of the client */
-		hp = Gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr,
-							sizeof(clientaddr.sin_addr.s_addr), AF_INET);
-		haddrp = inet_ntoa(clientaddr.sin_addr);
-		printf("server connected to %s (%s)\n", hp->h_name, haddrp);	
+		//hp = Gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr,
+		//					sizeof(clientaddr.sin_addr.s_addr), AF_INET);
+		//haddrp = inet_ntoa(clientaddr.sin_addr);
+		//printf("server connected to %s (%s)\n", hp->h_name, haddrp);	
 		
 
 		// Establish connection between client and server
-		if (!connectionClientServer(clientfd))
+		if (connectionClientServer(clientfd))
 		{
-			printf("Error - Connection unsuccessful\n");
+			printf("Connection successful!\n");
 		}
 		else
-			printf("Connection successful\n");
+			printf("Error - Connection unsuccessful\n");
 
 		Close(clientfd);
+
+		printf("------------ End connection ------------ \n");
+		printf("\n");
 	}	
 
     exit(0);
@@ -78,99 +98,155 @@ int connectionClientServer(int clientfd)
 	rio_t rio_client, rio_server;
 	char buf[MAXLINE];	
 
-	char *get = malloc(sizeof(char) * 4);
-	char *URI = malloc(sizeof(char) * 128);
+	char URI[MAXLINE];
+	int get_post = 0;
 
-	char request_type[128];
-	int server_status = 0;	
+	int server_status = -1;	
 	
-	char serverName[128];
-	char serverPathName[128];
+	char serverName[MAXLINE];
+	char serverPathName[MAXLINE];
 	int serverPort[1];
 
-	// Start reading from client socket.
+	int contentLength = -1;
+	int encodingChunked = 0;
+
+	// Initialize client socket buffer.
 	Rio_readinitb(&rio_client, clientfd);
 
+
+	printf("\n---------Debug: Read Header! \n\n");
+
+	
 	// Read the URI from the http request.
-	n = Rio_readlineb_w(&rio_client, buf, MAXLINE);
-	sscanf(buf, "%s %s", get, URI);
-	if (!strcmp(get, "GET"))
+	if (( n = Rio_readlineb_w(&rio_client, buf, MAXLINE)) == 0)
 	{
-		strcat(URI, "\0");		// Null terminated'
-		free(get);
+		printf("Failed to receive GET header from client\n");
+		return 0;
 	}
-	else
-		return 0;
-
-	printf("URI: %s, %lu \n", (char *)URI, strlen(URI));					
-		
-	// Invalid URL (www.)
-	if (!invalidURI(URI))
-		return 0;
-
+	sscanf(buf, "GET %s", (char *)URI);
 
 	// Get the server info from the URI
 	if (parse_uri(URI, serverName, serverPathName, serverPort) == -1)
-		printf("Error yo!\n");
-
-	free(URI);
+	{	
+		printf("Unable to parse the URI!\n");
+		return 0;
+	}
 
 	// Print server info
 	printf("Server name: %s \n", serverName);
 	printf("Server path: %s \n", serverPathName);
 	printf("Server port: %d \n", serverPort[0]);
-	printf("\n");
-	
+	printf("\n");	
 
+
+	printf("\n---------Debug: Establish connection! \n\n");
+
+	
 	// Establish connection to server
-	serverfd = Open_clientfd(serverName, serverPort[0]);
+	if ( (serverfd = Open_clientfd(serverName, serverPort[0])) < 0)
+	{
+		printf("Unable to connect to web server! \n");
+		Close(serverfd);
+		return 0;
+	}
 	Rio_readinitb(&rio_server, serverfd);
 
+
+	printf("\n---------Debug: Send http request! \n\n");
+
+		
 	// Send http request to web server
 	while (strcmp(buf, "\r\n") != 0)
 	{
-		if (!strncmp(buf, "Connection:", 11))
+		// Modify the GET 
+		if (!strncmp(buf, "GET", 3))
 		{
-			strcpy(buf, "Connection: close\r\n");
+			sprintf(buf, "GET /%s HTTP/1.1\r\n", serverPathName);
+			get_post = 1;
 			n = strlen(buf);
 		}
+		else if (!strncmp(buf, "POST", 4))
+		{
+			sprintf(buf, "POST /%s HTTP/1.1\r\n", serverPathName);
+			get_post = 1;
+			n = strlen(buf);
+		}
+
 		Rio_writen_w(serverfd, buf, n);
 		Fputs(buf, stdout);
-
-		n = Rio_readlineb_w(&rio_client, buf, MAXLINE);
+		n = Rio_readlineb_w(&rio_client, buf, MAXLINE);	
 	}
 
-	Rio_writen_w(serverfd, buf, n); // Send final http request line '/\r\n\r\n'
+	// Send the final request header
+	Rio_writen_w(serverfd, buf, n);
 	Fputs(buf, stdout);
+	
+
+
+
+	printf("\n---------Debug: Receive response header! \n\n");
+
+	
 
 
 	// Receive server response header
-	n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
-	while ( strcmp(buf, "\r\n") != 0 )
+	strcpy(buf, "\0");
+	while ( strcmp(buf, "\r\n") != 0 && n > 0 )
 	{	
-		if (!strncmp(buf, "HTTP", 4))
-		{
-			sscanf(buf, "%s %d", request_type, &server_status);
-		}
-	
-		Fputs(buf, stdout);
-		Rio_writen_w(clientfd, buf, n);
 		n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
+		Rio_writen_w(clientfd, buf, n);
+		Fputs(buf, stdout);
+
+		// Parse the server status code
+		sscanf(buf, "HTTP/1.1 %d", &server_status);
+
+
+		// Parse Transfer Encoding
+		if (!strncmp(buf, "Transfer-Encoding: chunked", 26))
+		{
+			encodingChunked = 1;
+		}
+
+		// Parse Content Length
+		sscanf(buf, "Content-Length: %d", &contentLength);
 	}
 
+
+
+
+	printf("\n---------Debug: Receive content! \n\n");
+
+	
 
 	// Receive server content
 	if (server_status == 200)
 	{
-
 		printf("200 OK! \n");
-		//n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
-		//while (strcmp(buf, "\r\n") != 0 )
-		//{
-		//	Rio_writen_w(clientfd, buf, n);
-		//	n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
-		//}
+		
+		if (!encodingChunked && contentLength != -1)
+		{
+			while ( (n = Rio_readnb_w(&rio_server, buf, MIN(MAXLINE, contentLength))) != 0 )
+			{
+				printf("Content remaining: %d \n", MIN(MAXLINE, contentLength));
+				printf("n: %d \n", n);
+				Rio_writen_w(clientfd, buf, n);
+
+				contentLength -= n;
+			}
+		}
+		else
+		{
+			while ( (n = Rio_readnb_w(&rio_server, buf, 64)) == 64 )
+			{
+				//printf("Bytes read: %d \n", n);
+				Rio_writen_w(clientfd,buf,n);
+			}
+			printf("Bytes read: %d \n", n);
+			Rio_writen_w(clientfd,buf,n);
+			
+		}
 	}
+
 	printf("Done reading yo\n");
 
 	Close(serverfd);
@@ -240,6 +316,7 @@ int parse_uri(char *uri, char *hostname, char *pathname, int *port)
 	printf("Hostend: %s \n", (char *)hostend);
     len = hostend - hostbegin;
 	printf("Len: %d \n",len);
+
     strncpy(hostname, hostbegin, len);
     hostname[len] = '\0';
 
@@ -258,6 +335,8 @@ int parse_uri(char *uri, char *hostname, char *pathname, int *port)
 	pathbegin++;	
 	strcpy(pathname, pathbegin);
     }
+
+	
 
     return 0;
 }
@@ -325,11 +404,11 @@ int Rio_writen_w(int fd, void *usrbuf, size_t n)
 	return 1;
 }
 
-ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n)
+ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n_size)
 {
-	size_t rc;
+	ssize_t rc;
 
-	if ( (rc = rio_readnb(rp, usrbuf, n)) < 0)
+	if ( (rc = rio_readnb(rp, usrbuf, n_size)) < 0)
 	{
 		printf("Rio_readnb_w error!\n");
 		return 0;
