@@ -21,39 +21,35 @@ void echo(int connfd);
 char *getURIFromRequest(int connfd);
 ssize_t Rio_readlineb_w(rio_t *rp, void *usrbuf, size_t maxlen);
 int Rio_writen_w(int fd, void *usrbuf, size_t n);
-ssize_t Rio_readnb(rio_t *rp, void *usrbuf, size_t n);
+ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n);
+int invalidURI(char URI[]);
+int connectionClientServer(int clientfd);
 
 /* 
  * main - Main routine for the proxy program 
  */
 int main(int argc, char **argv)
 {
-	int listenfd, connfd, port;
+	int listenfd, clientfd, port;
 	socklen_t clientlen = sizeof(struct sockaddr_in);
 	struct sockaddr_in clientaddr;
 	struct hostent *hp;
 	char *haddrp;
-	char *URI;
 
-	char serverName[128];
-	serverName[0] = '\0';
-	char serverPathName[128];
-	int serverPort[1];
-
-    /* Check arguments */
+	/* Check arguments */
     if (argc != 2) 
 	{
 		fprintf(stderr, "Usage: %s <port number>\n", argv[0]);
 		exit(0);
     }
 
-	port = atoi(argv[1]);
+	port = atoi(argv[1]); // proxy port
 	listenfd = Open_listenfd(port);
 
 	// Start listener
 	while (1)
 	{
-		connfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
+		clientfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
 
 		/* Determine the domain name and IP address of the client */
 		hp = Gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr,
@@ -61,24 +57,129 @@ int main(int argc, char **argv)
 		haddrp = inet_ntoa(clientaddr.sin_addr);
 		printf("server connected to %s (%s)\n", hp->h_name, haddrp);	
 		
-		// Get the URI from the HTTP request	
-		URI = getURIFromRequest(connfd);	
 
-		printf("URI: %s, %lu \n", (char *)URI, strlen(URI));					
+		// Establish connection between client and server
+		if (!connectionClientServer(clientfd))
+		{
+			printf("Error - Connection unsuccessful\n");
+		}
+		else
+			printf("Connection successful\n");
 
-		
-		//serverName = malloc(sizeof(char) * 128);
-		//serverPathName = malloc(sizeof(char) * 128);
-		//serverPort = malloc(sizeof(int));
-		
-		if (parse_uri(URI, serverName, serverPathName, serverPort) == -1)
-			printf("Error yo!\n");
-
-		Close(connfd);
+		Close(clientfd);
 	}	
 
     exit(0);
 }
+
+int connectionClientServer(int clientfd)
+{
+	int n, serverfd;
+	rio_t rio_client, rio_server;
+	char buf[MAXLINE];	
+
+	char *get = malloc(sizeof(char) * 4);
+	char *URI = malloc(sizeof(char) * 128);
+
+	char request_type[128];
+	int server_status = 0;	
+	
+	char serverName[128];
+	char serverPathName[128];
+	int serverPort[1];
+
+	// Start reading from client socket.
+	Rio_readinitb(&rio_client, clientfd);
+
+	// Read the URI from the http request.
+	n = Rio_readlineb_w(&rio_client, buf, MAXLINE);
+	sscanf(buf, "%s %s", get, URI);
+	if (!strcmp(get, "GET"))
+	{
+		strcat(URI, "\0");		// Null terminated'
+		free(get);
+	}
+	else
+		return 0;
+
+	printf("URI: %s, %lu \n", (char *)URI, strlen(URI));					
+		
+	// Invalid URL (www.)
+	if (!invalidURI(URI))
+		return 0;
+
+
+	// Get the server info from the URI
+	if (parse_uri(URI, serverName, serverPathName, serverPort) == -1)
+		printf("Error yo!\n");
+
+	free(URI);
+
+	// Print server info
+	printf("Server name: %s \n", serverName);
+	printf("Server path: %s \n", serverPathName);
+	printf("Server port: %d \n", serverPort[0]);
+	printf("\n");
+	
+
+	// Establish connection to server
+	serverfd = Open_clientfd(serverName, serverPort[0]);
+	Rio_readinitb(&rio_server, serverfd);
+
+	// Send http request to web server
+	while (strcmp(buf, "\r\n") != 0)
+	{
+		if (!strncmp(buf, "Connection:", 11))
+		{
+			strcpy(buf, "Connection: close\r\n");
+			n = strlen(buf);
+		}
+		Rio_writen_w(serverfd, buf, n);
+		Fputs(buf, stdout);
+
+		n = Rio_readlineb_w(&rio_client, buf, MAXLINE);
+	}
+
+	Rio_writen_w(serverfd, buf, n); // Send final http request line '/\r\n\r\n'
+	Fputs(buf, stdout);
+
+
+	// Receive server response header
+	n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
+	while ( strcmp(buf, "\r\n") != 0 )
+	{	
+		if (!strncmp(buf, "HTTP", 4))
+		{
+			sscanf(buf, "%s %d", request_type, &server_status);
+		}
+	
+		Fputs(buf, stdout);
+		Rio_writen_w(clientfd, buf, n);
+		n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
+	}
+
+
+	// Receive server content
+	if (server_status == 200)
+	{
+
+		printf("200 OK! \n");
+		//n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
+		//while (strcmp(buf, "\r\n") != 0 )
+		//{
+		//	Rio_writen_w(clientfd, buf, n);
+		//	n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
+		//}
+	}
+	printf("Done reading yo\n");
+
+	Close(serverfd);
+
+	return 1;
+}
+
+
+
 
 /*
  * echo - ECHO
@@ -94,42 +195,21 @@ void echo(int connfd)
 	while (( n = Rio_readlineb(&rio, buf, MAXLINE)) != 0)
 	{
 		printf("%s",buf);
-		Rio_writen(connfd, buf, n);
+		Rio_writen_w(connfd, buf, n);
 	}
 }
 
+
 /*
- * getURIFromRequest - Parses the URI from the HTTP Request.
+ * invalidURI - Returns 1 if the URI starts with http://www.
  */
-char *getURIFromRequest(int connfd)
+int invalidURI(char URI[])
 {
-	int n;
-	char buf[MAXLINE];
-	rio_t rio;
-	char *host = malloc(sizeof(char) * 128);
-	char *URI_short = malloc(sizeof(char) * 128);
-	char *URI = malloc(sizeof(char) * 128);	
-
-	Rio_readinitb(&rio, connfd);
-	while (( n = Rio_readlineb_w(&rio, buf, MAXLINE)) != 0)
-	{
-		sscanf(buf, "%s %s", host, URI_short);
-
-		if (!strcmp(host, "Host:"))
-		{
-			strcpy(URI, "http://");
-			strcat(URI, URI_short);
-			URI[strlen(URI)] = '\0';	
+	if (!strncmp("http://www.", URI, 11))
+		return 1;
 	
-			free(host);
-			free(URI_short);
-
-			printf("Size %lu: \n", strlen(URI));
-			return URI;
-		}
-	}
-	
-	return NULL;
+	printf("Error: Invalid URI\n");
+	return 0;
 }
 
 
@@ -152,30 +232,23 @@ int parse_uri(char *uri, char *hostname, char *pathname, int *port)
 	hostname[0] = '\0';
 	return -1;
     }
-	printf("1\n");
        
     /* Extract the host name */
     hostbegin = uri + 7;
 	printf("Hostbegin: %s \n", (char *)hostbegin);
     hostend = strpbrk(hostbegin, " :/\r\n\0");
 	printf("Hostend: %s \n", (char *)hostend);
-	printf("2\n");
     len = hostend - hostbegin;
 	printf("Len: %d \n",len);
     strncpy(hostname, hostbegin, len);
-	printf("2\n");
     hostname[len] = '\0';
-
-	printf("1\n");
 
     
     /* Extract the port number */
     *port = 80; /* default */
     if (*hostend == ':')   
 	*port = atoi(hostend + 1);
-    
-	printf("1\n");
-    
+     
 	/* Extract the path */
     pathbegin = strchr(hostbegin, '/');
     if (pathbegin == NULL) {
