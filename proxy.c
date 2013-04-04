@@ -18,7 +18,7 @@
 /*
  * Function prototypes
  */
-int connectionClientServer(int clientfd);
+int connectionClientServer(int clientfd, struct sockaddr_in *clientaddr);
 int forwardHttpRequest(rio_t *rio_client, int serverfd, char method[], char serverPath[], char version[]);
 int forwardResponseHeader(rio_t *rio_server, int clientfd, int *statusCode, int *contentLength, char *transferEncoding);
 int forwardPayload(rio_t *rio_server, int clientfd, char transferEncoding[], int contentLength);
@@ -28,6 +28,15 @@ ssize_t Rio_readlineb_w(rio_t *rp, void *usrbuf, size_t maxlen);
 int Rio_writen_w(int fd, void *usrbuf, size_t n);
 ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n);
 
+void Logger(struct sockaddr_in *sockaddr,char *uri);
+void *thread(void *varp);
+int open_clientfd_ts(char *hostname, int port, int *privatep); 
+
+sem_t mutex1,mutex2;
+typedef struct{
+	int clientfd;
+	struct sockaddr_in clientaddr;
+} client_struct;
 
 /* 
  * main - Main routine for the proxy program 
@@ -39,7 +48,14 @@ int main(int argc, char **argv)
 	struct sockaddr_in clientaddr;
 	//struct hostent *hp;
 	//char *haddrp;
-
+	
+	//argument input for pthread_create
+	pthread_t tid;	
+	client_struct *args;
+	//initialize semaphores
+	sem_init(&mutex1,0,1);   
+	sem_init(&mutex2,0,1);
+	
 	/* Check arguments */
     if (argc != 2) 
 	{
@@ -55,9 +71,14 @@ int main(int argc, char **argv)
 	// Start listener
 	while (1)
 	{
-
+		args=(client_struct*)Malloc(sizeof(client_struct));
 		clientfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
 		
+		args->clientfd = clientfd;
+		args->clientaddr = clientaddr;
+		
+		if(pthread_create(&tid,NULL,thread,(void*) args)<0)
+		printf("problem when creating thread \n");
 
 		printf("\n");
 		printf("------------ Start connection ------------ \n");
@@ -70,14 +91,14 @@ int main(int argc, char **argv)
 		
 
 		// Establish connection between client and server
-		if (connectionClientServer(clientfd))
+	/*if(connectionClientServer(clientfd))
 		{
 			printf("Connection successful!\n");
 		}
 		else
 			printf("Error - Connection unsuccessful\n");
-
-		Close(clientfd);
+	*/
+		
 
 		printf("------------ End connection ------------ \n");
 		printf("\n");
@@ -86,7 +107,7 @@ int main(int argc, char **argv)
     exit(0);
 }
 
-int connectionClientServer(int clientfd)
+int connectionClientServer(int clientfd, struct sockaddr_in *clientaddr)
 {
 	int serverfd;
 	rio_t rio_client, rio_server;
@@ -105,7 +126,8 @@ int connectionClientServer(int clientfd)
  	 *
  	 */ 
 	printf("\n---------Debug: Read Header! \n\n");
-	Rio_readlineb_w(&rio_client, buf, MAXLINE);
+	if ( (Rio_readlineb_w(&rio_client, buf, MAXLINE)) == 0)
+		return 0;
 	sscanf(buf, "%s %s %s", method, URI, version);
 	
 	// Check for merhod implementation	
@@ -113,6 +135,10 @@ int connectionClientServer(int clientfd)
 		printf("Method %s is not implemented \n", method);
 		return 0;
 	}
+	
+	P(&mutex1);
+	Logger(clientaddr, URI);
+	V(&mutex1);
 
 	// Get the server info from the URI
 	if (parse_uri(URI, serverName, serverPath, &serverPort) == -1){	
@@ -134,9 +160,9 @@ int connectionClientServer(int clientfd)
 	printf("Server port: %d \n", serverPort);
 	printf("\n");	
 	
-	
+	int privatep;
 	// Establish connection to server
-	if ( (serverfd = Open_clientfd(serverName, serverPort)) < 0){
+	if ( (serverfd = open_clientfd_ts(serverName, serverPort, &privatep)) < 0){
 		printf("Unable to connect to web server! \n");
 		Close(serverfd);
 		return 0;
@@ -206,6 +232,16 @@ int forwardHttpRequest(rio_t *rio_client, int serverfd, char serverPath[], char 
 
 		if ( (n = Rio_readlineb_w(rio_client, buf, MAXLINE)) == 0)
 			return 0;
+
+		if ( !strncmp(buf, "Connection", 10) ){
+			sprintf(buf, "Connection: close\r\n");
+			n = strlen(buf);
+		}
+		else if ( !strncmp(buf, "Proxy-Connection", 16) ){
+			sprintf(buf, "Proxy-Connection: close\r\n");
+			n = strlen(buf);
+		}
+			
 	}		
 	
 	// Send the final http request line ("\r\n")
@@ -271,6 +307,7 @@ int forwardPayload(rio_t *rio_server, int clientfd, char transferEncoding[], int
 		// The process therefore stops!
 		//
 		while ( (n = Rio_readlineb_w(rio_server, buf, MAXLINE)) > 0 ){
+			Rio_writen_w(clientfd, buf, n);
 			sscanf(buf, "%x", &chunksize);
 			printf("chunksize: %d\n", chunksize);
 			if (!chunksize)
@@ -280,7 +317,11 @@ int forwardPayload(rio_t *rio_server, int clientfd, char transferEncoding[], int
 			//sscanf(buf, "%x", &chunksize);
 			Rio_writen_w(clientfd, buf, n);
 			chunksize = 0;
+
+			n = Rio_readlineb_w(rio_server, buf, MAXLINE);
+			Rio_writen_w(clientfd, buf, n);
 		}
+		Rio_writen_w(clientfd, buf, n);
 	}
 	return 1;
 }
@@ -371,7 +412,7 @@ void format_log_entry(char *logstring, struct sockaddr_in *sockaddr,
 
 
     /* Return the formatted log entry string */
-    sprintf(logstring, "%s: %d.%d.%d.%d %s", time_str, a, b, c, d, uri);
+    sprintf(logstring, "%s: %d.%d.%d.%d %s %d \n", time_str, a, b, c, d, uri, size);
 }
 
 /************************************
@@ -413,5 +454,54 @@ ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n_size)
 
 	return rc;
 }
+void Logger(struct sockaddr_in *sockaddr,char *uri)
+{	
+	char my_string[MAXLINE];
+	int size=10;
+	format_log_entry(my_string, sockaddr,uri, size);
+	FILE *fp;
 
+	fp = fopen("proxy.log","a");
+	if(fp ==NULL) {
+		printf("I could not open proxy.log for writing. \n");
+	}
+	else
+		fprintf(fp, my_string);
+	//free(my_string);
+	fclose(fp);
+}
+
+void *thread(void *vargp)
+{
+	client_struct *args =vargp; 
+	pthread_detach(pthread_self());
+	
+	int clientfd = args->clientfd;
+	struct sockaddr_in clientaddr = args->clientaddr;
+	
+	// Establish connection between client and server
+	if (!connectionClientServer(clientfd, &clientaddr))
+	{
+		printf("Error - Connection unsuccessful\n");
+	}
+	else
+		printf("Connection successful\n");
+	
+	Free(vargp);
+	//int myid = (int)vargp;
+	//static int cnt = 0;
+	//printf(" [%d] : (cnt=%d)\n", myid, ++cnt);
+	Close(clientfd);
+	return NULL;
+}  
+int open_clientfd_ts(char *hostname, int port, int *privatep)
+{
+	int sharedp;
+
+	P(&mutex2);
+	sharedp = Open_clientfd(hostname, port);
+	*privatep = sharedp;
+	V(&mutex2);
+	return *privatep;
+}
 
