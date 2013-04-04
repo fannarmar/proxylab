@@ -18,21 +18,15 @@
 /*
  * Function prototypes
  */
-int parse_uri(char *uri, char *target_addr, char *path, int  *port);
+int connectionClientServer(int clientfd);
+int forwardHttpRequest(rio_t *rio_client, int serverfd, char method[], char serverPath[], char version[]);
+int forwardResponseHeader(rio_t *rio_server, int clientfd, int *statusCode, int *contentLength, char *transferEncoding);
+int forwardPayload(rio_t *rio_server, int clientfd, char transferEncoding[], int contentLength);
+int parse_uri(char *uri, char *hostname, char *pathname, int *port);
 void format_log_entry(char *logstring, struct sockaddr_in *sockaddr, char *uri, int size);
-void echo(int connfd);
-char *getURIFromRequest(int connfd);
 ssize_t Rio_readlineb_w(rio_t *rp, void *usrbuf, size_t maxlen);
 int Rio_writen_w(int fd, void *usrbuf, size_t n);
 ssize_t Rio_readnb_w(rio_t *rp, void *usrbuf, size_t n);
-int invalidURI(char URI[]);
-int connectionClientServer(int clientfd);
-
-void sigpipehandler(int sig)
-{
-	/* DO NOTHING */
-}
-
 
 
 /* 
@@ -53,7 +47,7 @@ int main(int argc, char **argv)
 		exit(0);
     }
 
-	signal(SIGPIPE, sigpipehandler);
+	signal(SIGPIPE, SIG_IGN);
 
 	port = atoi(argv[1]); // proxy port
 	listenfd = Open_listenfd(port);
@@ -94,198 +88,201 @@ int main(int argc, char **argv)
 
 int connectionClientServer(int clientfd)
 {
-	int n, serverfd;
+	int serverfd;
 	rio_t rio_client, rio_server;
-	char buf[MAXLINE];	
-
-	char URI[MAXLINE];
-	int get_post = 0;
-
-	int server_status = -1;	
-	
-	char serverName[MAXLINE];
-	char serverPathName[MAXLINE];
-	int serverPort[1];
-
-	int contentLength = -1;
-	int encodingChunked = 0;
+	char buf[MAXLINE], method[MAXLINE], URI[MAXLINE], version[MAXLINE];	
+	char serverName[MAXLINE], serverPath[MAXLINE];
+	int serverPort;
+	char transferEncoding[32];
+	int statusCode, contentLength;
 
 	// Initialize client socket buffer.
 	Rio_readinitb(&rio_client, clientfd);
 
-
+	/*
+ 	 * 
+ 	 * Parse the URI from the request header
+ 	 *
+ 	 */ 
 	printf("\n---------Debug: Read Header! \n\n");
-
+	Rio_readlineb_w(&rio_client, buf, MAXLINE);
+	sscanf(buf, "%s %s %s", method, URI, version);
 	
-	// Read the URI from the http request.
-	if (( n = Rio_readlineb_w(&rio_client, buf, MAXLINE)) == 0)
-	{
-		printf("Failed to receive GET header from client\n");
+	// Check for merhod implementation	
+	if (strcasecmp(method, "GET") != 0) {
+		printf("Method %s is not implemented \n", method);
 		return 0;
 	}
-	sscanf(buf, "GET %s", (char *)URI);
 
 	// Get the server info from the URI
-	if (parse_uri(URI, serverName, serverPathName, serverPort) == -1)
-	{	
+	if (parse_uri(URI, serverName, serverPath, &serverPort) == -1){	
 		printf("Unable to parse the URI!\n");
 		return 0;
 	}
 
-	// Print server info
-	printf("Server name: %s \n", serverName);
-	printf("Server path: %s \n", serverPathName);
-	printf("Server port: %d \n", serverPort[0]);
-	printf("\n");	
-
-
+	/*
+ 	 *
+ 	 * Connect to web server
+ 	 *
+ 	 */ 	
 	printf("\n---------Debug: Establish connection! \n\n");
 
+	// Print server info
+	
+	printf("Server name: %s \n", serverName);
+	printf("Server path: %s \n", serverPath);
+	printf("Server port: %d \n", serverPort);
+	printf("\n");	
+	
 	
 	// Establish connection to server
-	if ( (serverfd = Open_clientfd(serverName, serverPort[0])) < 0)
-	{
+	if ( (serverfd = Open_clientfd(serverName, serverPort)) < 0){
 		printf("Unable to connect to web server! \n");
 		Close(serverfd);
 		return 0;
 	}
-	Rio_readinitb(&rio_server, serverfd);
 
-
+	/*
+ 	 *
+ 	 * Forward http request from client to server
+ 	 *
+ 	 */
 	printf("\n---------Debug: Send http request! \n\n");
-
-		
-	// Send http request to web server
-	while (strcmp(buf, "\r\n") != 0)
-	{
-		// Modify the GET 
-		if (!strncmp(buf, "GET", 3))
-		{
-			sprintf(buf, "GET /%s HTTP/1.1\r\n", serverPathName);
-			get_post = 1;
-			n = strlen(buf);
-		}
-		else if (!strncmp(buf, "POST", 4))
-		{
-			sprintf(buf, "POST /%s HTTP/1.1\r\n", serverPathName);
-			get_post = 1;
-			n = strlen(buf);
-		}
-
-		Rio_writen_w(serverfd, buf, n);
-		Fputs(buf, stdout);
-		n = Rio_readlineb_w(&rio_client, buf, MAXLINE);	
+	if (!forwardHttpRequest(&rio_client, serverfd, serverPath, method, version)){
+		Close(serverfd);
+		return 0;
 	}
 
-	// Send the final request header
-	Rio_writen_w(serverfd, buf, n);
-	Fputs(buf, stdout);
-	
 
-
-
+	/*
+ 	 *
+ 	 * Forward response header from server to client
+ 	 * Parse 
+ 	 * 		- Status Code
+ 	 * 		- Content Length (if any)
+ 	 * 		- Transfer Encoding (if any)
+ 	 *
+ 	 */ 
 	printf("\n---------Debug: Receive response header! \n\n");
-
-	
-
-
-	// Receive server response header
-	strcpy(buf, "\0");
-	while ( strcmp(buf, "\r\n") != 0 && n > 0 )
-	{	
-		n = Rio_readlineb_w(&rio_server, buf, MAXLINE);
-		Rio_writen_w(clientfd, buf, n);
-		Fputs(buf, stdout);
-
-		// Parse the server status code
-		sscanf(buf, "HTTP/1.1 %d", &server_status);
-
-
-		// Parse Transfer Encoding
-		if (!strncmp(buf, "Transfer-Encoding: chunked", 26))
-		{
-			encodingChunked = 1;
-		}
-
-		// Parse Content Length
-		sscanf(buf, "Content-Length: %d", &contentLength);
+	Rio_readinitb(&rio_server, serverfd);
+	if (!forwardResponseHeader(&rio_server, clientfd, &statusCode, &contentLength, transferEncoding)){
+		Close(serverfd);
+		return 0;
 	}
 
 
-
-
+	/*
+	 *
+ 	 * Forward payload from server to client
+ 	 * Only if 200 OK
+ 	 */ 
 	printf("\n---------Debug: Receive content! \n\n");
-
-	
-
-	// Receive server content
-	if (server_status == 200)
-	{
-		printf("200 OK! \n");
-		
-		if (!encodingChunked && contentLength != -1)
-		{
-			while ( (n = Rio_readnb_w(&rio_server, buf, MIN(MAXLINE, contentLength))) != 0 )
-			{
-				printf("Content remaining: %d \n", MIN(MAXLINE, contentLength));
-				printf("n: %d \n", n);
-				Rio_writen_w(clientfd, buf, n);
-
-				contentLength -= n;
-			}
-		}
-		else
-		{
-			while ( (n = Rio_readnb_w(&rio_server, buf, 64)) == 64 )
-			{
-				//printf("Bytes read: %d \n", n);
-				Rio_writen_w(clientfd,buf,n);
-			}
-			printf("Bytes read: %d \n", n);
-			Rio_writen_w(clientfd,buf,n);
-			
-		}
+	if (statusCode == 200){
+		forwardPayload(&rio_server, clientfd, transferEncoding, contentLength);
 	}
-
-	printf("Done reading yo\n");
-
 	Close(serverfd);
 
 	return 1;
 }
 
-
-
-
 /*
- * echo - ECHO
- * Function that reads and echoes text lines.
+ * forwardHttpRequest
+ *
+ * Forwards http request from client to server
+ *
  */
-void echo(int connfd)
-{
-	int n;
+int forwardHttpRequest(rio_t *rio_client, int serverfd, char serverPath[], char method[], char version[]){
 	char buf[MAXLINE];
-	rio_t rio;
+	int n;
 
-	Rio_readinitb(&rio, connfd);
-	while (( n = Rio_readlineb(&rio, buf, MAXLINE)) != 0)
-	{
-		printf("%s",buf);
-		Rio_writen_w(connfd, buf, n);
-	}
+	// Restructure the http method line
+	sprintf(buf, "GET /%s HTTP/1.1\r\n", serverPath);
+	n = strlen(buf);
+	
+	// Forward the request to web server
+	while ( strcmp(buf, "\r\n") != 0 ){
+		Rio_writen_w(serverfd,buf,n);
+		Fputs(buf, stdout);
+
+		if ( (n = Rio_readlineb_w(rio_client, buf, MAXLINE)) == 0)
+			return 0;
+	}		
+	
+	// Send the final http request line ("\r\n")
+	Rio_writen_w(serverfd,buf,n);
+	Fputs(buf, stdout);
+
+	return 1;
 }
 
+/*
+ * forwardResponseHeader
+ *
+ * Forwards the response header from server to client
+ * Parses
+ * 		- Status Code
+ * 		- Content Length (if any)
+ * 		- Transfer Encoding (if any)
+ */
+int forwardResponseHeader(rio_t *rio_server, int clientfd, int *statusCode, int *contentLength, char *transferEncoding){
+	char buf[MAXLINE];
+	int n;
+
+	strcpy(buf, "\0"); // Initialize buffer
+
+	while ( strcmp(buf, "\r\n") != 0)	{	
+		if ( (n = Rio_readlineb_w(rio_server, buf, MAXLINE)) == 0)
+			return 1;
+		Rio_writen_w(clientfd, buf, n);
+		Fputs(buf, stdout);
+
+		// Parse status code, content length and transfer encoding
+		sscanf(buf, "HTTP/1.1 %d", statusCode);
+		sscanf(buf, "Content-Length: %d", contentLength);
+		sscanf(buf, "Transfer-Encoding: %s", transferEncoding);
+	}
+	
+	return 1;
+}
 
 /*
- * invalidURI - Returns 1 if the URI starts with http://www.
+ * forwardPayload
+ *
+ * Forwards the payload from the server to the client
+ *
  */
-int invalidURI(char URI[])
-{
-	if (!strncmp("http://www.", URI, 11))
-		return 1;
-	
-	printf("Error: Invalid URI\n");
-	return 0;
+int forwardPayload(rio_t *rio_server, int clientfd, char transferEncoding[], int contentLength){
+	char buf[MAXLINE];
+	int n;
+	int chunksize = 0;	
+
+	if (contentLength > 0 && strcmp(transferEncoding, "chunked") != 0){
+		// Only use content length if transfer encoding is not defined as chunks and
+		// content length is defined.
+		while ( (n = Rio_readnb_w(rio_server, buf, MIN(MAXLINE, contentLength))) > 0 ){
+			Rio_writen_w(clientfd, buf, n);
+			contentLength -= n;
+		}
+	}
+	else {
+		// BUG - Bottle neck
+		// If any additional data is requested with readnb than there is on the socket
+		// buffer, the function stops and waits for the data.
+		// The process therefore stops!
+		//
+		while ( (n = Rio_readlineb_w(rio_server, buf, MAXLINE)) > 0 ){
+			sscanf(buf, "%x", &chunksize);
+			printf("chunksize: %d\n", chunksize);
+			if (!chunksize)
+				break; 
+    		n = Rio_readnb_w(rio_server, buf, MIN(MAXLINE, chunksize));
+			//chunksize -= n;
+			//sscanf(buf, "%x", &chunksize);
+			Rio_writen_w(clientfd, buf, n);
+			chunksize = 0;
+		}
+	}
+	return 1;
 }
 
 
